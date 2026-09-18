@@ -17,11 +17,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Stage all three RC Docker images from existing, signed release artifacts.
+"""Stage selected RC Docker images from existing, signed release artifacts.
 
-Requires Python 3.9+, git, curl, GnuPG, bash, shasum and Docker Buildx (for --push).
+Requires Python 3.9+, git, curl and GnuPG; Quickstart also needs bash and shasum.
+Docker Buildx is required for --push.
 No Maven, JDK, Rust toolchain or signing private key is needed.
-Without --push, only prepare and verify the three Docker build contexts.
+Without --push, only prepare and verify the selected Docker build contexts.
 """
 
 import argparse
@@ -43,6 +44,7 @@ KEYS = "https://dist.apache.org/repos/dist/release/fluss/KEYS"
 GIT_URL = "https://github.com/apache/fluss.git"
 FLINK_VERSION = "1.20"
 EXTRA_JARS = ("fluss-flink-1.20", "fluss-flink-tiering")
+IMAGE_NAMES = ("fluss", "fluss-gateway", "fluss-quickstart-flink")
 
 
 def run(command, cwd=None, env=None, capture=False):
@@ -137,6 +139,61 @@ def copy_jar(source, repo, module):
     shutil.copy2(source, destination / source.name)
 
 
+def release_archives(version, images):
+    names = []
+    if "fluss" in images or "fluss-quickstart-flink" in images:
+        names.append(f"fluss-{version}-bin")
+    if "fluss-gateway" in images:
+        names.extend(
+            f"fluss-gateway-{version}-bin-linux-{arch}" for arch in ("amd64", "arm64")
+        )
+    return names
+
+
+def record_inputs(work, identity):
+    """Share verified downloads across selections without mixing RCs or Nexus repos."""
+    identity = dict(identity)
+    marker = work / "inputs.json"
+    if marker.exists():
+        previous = json.loads(marker.read_text())
+        # Core/Gateway runs need no Nexus URL. Preserve or establish the pinned
+        # repository when switching between these runs and Quickstart runs.
+        identity["nexus"] = identity["nexus"] or previous.get("nexus")
+        previous["nexus"] = previous.get("nexus") or identity["nexus"]
+        if previous != identity:
+            raise ValueError("Work directory belongs to different RC inputs; use another --work-dir")
+    marker.write_text(json.dumps(identity, indent=2) + "\n")
+    return identity
+
+
+def prepare_quickstart(args, repo, java, cache, env):
+    # These two artifacts are NOT included in the Java binary tarball.
+    for artifact in EXTRA_JARS:
+        name = f"{artifact}-{args.version}.jar"
+        base = f"{args.nexus}/org/apache/fluss/{artifact}/{args.version}/{name}"
+        jar = download(base, cache / name)
+        download(base + ".asc", Path(str(jar) + ".asc"))
+        verify_signature(jar, env)
+        copy_jar(jar, repo, "fluss-flink/" + artifact)
+
+    # Populate only the module outputs consumed by the RC's own prepare script.
+    # Hudi is currently checked as a prerequisite, although not copied to the image.
+    for plugin, artifact, module in (
+        ("s3", "fluss-fs-s3", "fluss-filesystems"),
+        ("paimon", "fluss-lake-paimon", "fluss-lake"),
+        ("iceberg", "fluss-lake-iceberg", "fluss-lake"),
+        ("hudi", "fluss-lake-hudi", "fluss-lake"),
+    ):
+        source = java / "plugins" / plugin / f"{artifact}-{args.version}.jar"
+        copy_jar(source, repo, module + "/" + artifact)
+    quickstart = repo / "docker/quickstart-flink"
+    dockerfile = (quickstart / "Dockerfile").read_text()
+    if not re.search(r"^FROM flink:1\.20\.", dockerfile, re.MULTILINE):
+        raise ValueError("Quickstart Flink base version changed; review the script before staging")
+    # This script only copies existing JARs and downloads its pinned third-party dependencies.
+    run(["bash", "./prepare_build.sh"], cwd=quickstart, env=env)
+
+
 def image_commands(args, repo, output, release_commit):
     suffix = f"{args.version}-rc{args.rc}"
     for context, name, tag in (
@@ -144,6 +201,8 @@ def image_commands(args, repo, output, release_commit):
         ("fluss-gateway", "fluss-gateway", suffix),
         ("quickstart-flink", "fluss-quickstart-flink", f"{FLINK_VERSION}-{suffix}"),
     ):
+        if name not in args.images:
+            continue
         image = f"{args.namespace}/{name}:{tag}"
         metadata = output / (name + ".metadata.json")
         command = ["docker", "buildx", "build"]
@@ -177,13 +236,17 @@ def remote_manifest(image):
     return json.loads(run(command, capture=True))
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="Release version, e.g. 1.0.0")
     parser.add_argument("--rc", required=True, type=int, help="RC number, e.g. 3")
     parser.add_argument(
-        "--nexus", required=True,
-        help="Exact closed RC staging URL, ending in orgapachefluss-NNNN",
+        "--images", nargs="+", choices=IMAGE_NAMES, default=IMAGE_NAMES,
+        help="Images to prepare/build/push (default: all three)",
+    )
+    parser.add_argument(
+        "--nexus",
+        help="Exact closed RC staging URL; required for fluss-quickstart-flink",
     )
     parser.add_argument(
         "--work-dir", type=Path, help="Download cache and isolated run directories"
@@ -193,25 +256,35 @@ def parse_args():
         "--namespace", default="apache", help="Docker repository namespace (default: apache)"
     )
     parser.add_argument(
-        "--push", action="store_true", help="Build, push and verify all three images"
+        "--push", action="store_true", help="Build, push and verify the selected images"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    args.images = [name for name in IMAGE_NAMES if name in args.images]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-incubating)?", args.version):
         parser.error("--version must be a release version, not a snapshot")
     if args.rc < 1:
         parser.error("--rc must be positive")
-    args.nexus = args.nexus.rstrip("/")
-    if not re.fullmatch(
-        r"https://repository\.apache\.org/content/repositories/orgapachefluss-[0-9]+",
-        args.nexus,
-    ):
-        parser.error("--nexus must identify one exact Apache Fluss staging repository")
+    if "fluss-quickstart-flink" in args.images and not args.nexus:
+        parser.error("--nexus is required when selecting fluss-quickstart-flink")
+    if args.nexus:
+        args.nexus = args.nexus.rstrip("/")
+        if not re.fullmatch(
+            r"https://repository\.apache\.org/content/repositories/orgapachefluss-[0-9]+",
+            args.nexus,
+        ):
+            parser.error("--nexus must identify one exact Apache Fluss staging repository")
     return args
 
 
 def main():
     args = parse_args()
-    for program in ["git", "curl", "gpg", "bash", "shasum"] + (["docker"] if args.push else []):
+    needs_quickstart = "fluss-quickstart-flink" in args.images
+    programs = ["git", "curl", "gpg"]
+    if needs_quickstart:
+        programs += ["bash", "shasum"]
+    if args.push:
+        programs.append("docker")
+    for program in programs:
         if not shutil.which(program):
             raise ValueError("Required executable not found: " + program)
     if args.push:
@@ -260,58 +333,32 @@ def main():
         "tag": tag,
         "commit": release_commit,
     }
-    marker = work / "inputs.json"
-    if marker.exists() and json.loads(marker.read_text()) != identity:
-        raise ValueError("Work directory belongs to different RC inputs; use another --work-dir")
-    marker.write_text(json.dumps(identity, indent=2) + "\n")
-
-    # These two artifacts are NOT included in the Java binary tarball.
-    for artifact in EXTRA_JARS:
-        name = f"{artifact}-{args.version}.jar"
-        base = f"{args.nexus}/org/apache/fluss/{artifact}/{args.version}/{name}"
-        jar = download(base, cache / name)
-        download(base + ".asc", Path(str(jar) + ".asc"))
-        verify_signature(jar, env)
-        copy_jar(jar, repo, "fluss-flink/" + artifact)
+    identity = record_inputs(work, identity)
 
     base_url = f"{DIST}/fluss-{args.version}-rc{args.rc}"
-    names = [f"fluss-{args.version}-bin"] + [
-        f"fluss-gateway-{args.version}-bin-linux-{arch}" for arch in ("amd64", "arm64")
-    ]
+    names = release_archives(args.version, args.images)
     for name in names:
         archive = cache / (name + ".tgz")
         for suffix in ("", ".asc", ".sha512"):
             download(base_url + "/" + archive.name + suffix, Path(str(archive) + suffix))
         verify_checksum(archive)
         verify_signature(archive, env)
-        if name == names[0]:
+        if name == f"fluss-{args.version}-bin":
             java = extract_distribution(archive, output / "java", f"fluss-{args.version}")
-            shutil.copytree(java, repo / "docker/fluss/build-target")
+            if "fluss" in args.images:
+                shutil.copytree(java, repo / "docker/fluss/build-target")
         else:
             arch = name.rsplit("-", 1)[1]
             gateway = extract_distribution(archive, output / arch, name)
             check_gateway_commit(gateway, release_commit)
             shutil.copytree(gateway, repo / "docker/fluss-gateway/build-target" / arch)
 
-    # Populate only the module outputs consumed by the RC's own prepare script.
-    # Hudi is currently checked as a prerequisite, although not copied to the image.
-    for plugin, artifact, module in (
-        ("s3", "fluss-fs-s3", "fluss-filesystems"),
-        ("paimon", "fluss-lake-paimon", "fluss-lake"),
-        ("iceberg", "fluss-lake-iceberg", "fluss-lake"),
-        ("hudi", "fluss-lake-hudi", "fluss-lake"),
-    ):
-        source = java / "plugins" / plugin / f"{artifact}-{args.version}.jar"
-        copy_jar(source, repo, module + "/" + artifact)
-    quickstart = repo / "docker/quickstart-flink"
-    dockerfile = (quickstart / "Dockerfile").read_text()
-    if not re.search(r"^FROM flink:1\.20\.", dockerfile, re.MULTILINE):
-        raise ValueError("Quickstart Flink base version changed; review the script before staging")
-    # This script only copies existing JARs and downloads its pinned third-party dependencies.
-    run(["bash", "./prepare_build.sh"], cwd=quickstart, env=env)
+    if needs_quickstart:
+        prepare_quickstart(args, repo, java, cache, env)
 
     inputs = {
         **identity,
+        "images": args.images,
         "sha512": {
             str(path.relative_to(repo)): sha512(path)
             for path in sorted((repo / "docker").rglob("*.jar"))
@@ -324,7 +371,8 @@ def main():
         + "\n".join(shlex.join(command) for _, _, command in images) + "\n"
     )
     if not args.push:
-        print("Prepared all three contexts. No Docker build or push was performed.")
+        print("Prepared contexts: " + ", ".join(args.images))
+        print("No Docker build or push was performed.")
         print("Review " + str(output / "build-commands.sh"))
         print("Re-run with --push to build, publish and verify the remote indexes.")
         return
@@ -345,7 +393,7 @@ def main():
         with (output / "image-digests.txt").open("a") as report:
             report.write(image + " " + digest + "\n")
         print("Verified: " + image + " -> " + digest, flush=True)
-    print("Completed all three images. Digests: " + str(output / "image-digests.txt"))
+    print("Completed selected images. Digests: " + str(output / "image-digests.txt"))
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@
 """Validate artifact rejection and publication plans without accessing a registry."""
 
 from argparse import Namespace
+from contextlib import redirect_stderr
 import hashlib
 import io
 from pathlib import Path
@@ -98,7 +99,8 @@ class DockerStagingTest(unittest.TestCase):
 
     def test_only_rc_tags_are_published_with_both_platforms(self):
         args = Namespace(
-            version="1.0.0", rc=3, namespace="example", builder="release"
+            version="1.0.0", rc=3, namespace="example", builder="release",
+            images=stage.IMAGE_NAMES,
         )
         images = list(stage.image_commands(
             args, Path("/tmp/source"), Path("/tmp/output"), "a" * 40
@@ -113,6 +115,84 @@ class DockerStagingTest(unittest.TestCase):
             self.assertEqual(command[command.index("--platform") + 1], "linux/amd64,linux/arm64")
             self.assertEqual(command[command.index("--builder") + 1], "release")
         self.assertIn("VCS_REF=" + "a" * 40, images[1][2])
+
+    def test_default_selection_keeps_all_three_images(self):
+        args = stage.parse_args([
+            "--version", "1.0.0", "--rc", "3", "--nexus",
+            "https://repository.apache.org/content/repositories/orgapachefluss-1016/",
+        ])
+        self.assertEqual(args.images, list(stage.IMAGE_NAMES))
+        self.assertTrue(args.nexus.endswith("orgapachefluss-1016"))
+
+    def test_only_requested_images_have_build_commands(self):
+        for selection in (
+            ["fluss"], ["fluss-gateway"], ["fluss-quickstart-flink"],
+            ["fluss", "fluss-gateway"],
+            ["fluss-quickstart-flink", "fluss-quickstart-flink"],
+        ):
+            with self.subTest(selection=selection):
+                args = stage.parse_args([
+                    "--version", "1.0.0", "--rc", "3", "--nexus",
+                    "https://repository.apache.org/content/repositories/orgapachefluss-1016",
+                    "--images", *selection,
+                ])
+                images = list(stage.image_commands(
+                    args, Path("/tmp/source"), Path("/tmp/output"), "a" * 40
+                ))
+                names = [image.split("/")[1].split(":")[0] for image, _, _ in images]
+                self.assertEqual(set(names), set(selection))
+                self.assertEqual(len(names), len(set(selection)))
+
+    def test_each_selection_downloads_only_required_archives(self):
+        java = "fluss-1.0.0-bin"
+        gateway = [
+            "fluss-gateway-1.0.0-bin-linux-amd64",
+            "fluss-gateway-1.0.0-bin-linux-arm64",
+        ]
+        for selection, expected in (
+            (["fluss"], [java]),
+            (["fluss-quickstart-flink"], [java]),
+            (["fluss-gateway"], gateway),
+            (["fluss", "fluss-quickstart-flink"], [java]),
+            (stage.IMAGE_NAMES, [java, *gateway]),
+        ):
+            with self.subTest(selection=selection):
+                self.assertEqual(stage.release_archives("1.0.0", selection), expected)
+
+    def test_nexus_is_required_only_for_quickstart(self):
+        base = ["--version", "1.0.0", "--rc", "3"]
+        for image in ("fluss", "fluss-gateway"):
+            self.assertIsNone(stage.parse_args(base + ["--images", image]).nexus)
+        for selection in ([], ["--images", "fluss-quickstart-flink"]):
+            with redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit):
+                stage.parse_args(base + selection)
+            self.assertIn("--nexus is required", error.getvalue())
+
+    def test_invalid_or_empty_image_selection_is_rejected(self):
+        for selection in (["--images", "unknown"], ["--images"]):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                stage.parse_args(["--version", "1.0.0", "--rc", "3"] + selection)
+            self.assertEqual(error.exception.code, 2)
+
+    def test_cache_can_switch_selections_without_mixing_nexus_repositories(self):
+        identity = {
+            "version": "1.0.0", "rc": 3, "tag": "v1.0.0-rc3",
+            "commit": "a" * 40, "nexus": None,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage.record_inputs(root, identity)
+            nexus_base = "https://repository.apache.org/content/repositories/orgapachefluss-"
+            quickstart = dict(identity, nexus=nexus_base + "1016")
+            self.assertEqual(stage.record_inputs(root, quickstart), quickstart)
+            self.assertEqual(stage.record_inputs(root, identity), quickstart)
+            for changed in (
+                dict(quickstart, nexus=nexus_base + "1017"),
+                dict(quickstart, commit="b" * 40),
+            ):
+                with self.assertRaisesRegex(ValueError, "different RC inputs"):
+                    stage.record_inputs(root, changed)
+            self.assertEqual(stage.record_inputs(root, identity), quickstart)
 
 
 if __name__ == "__main__":
